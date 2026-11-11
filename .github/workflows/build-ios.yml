@@ -11,8 +11,9 @@ permissions:
 
 jobs:
   build:
-    # macOS runner is required for Xcode / iOS toolchain.
-    runs-on: macos-14
+    # macos-14 (macos-14-arm64-us-default) was retired 2026-11-02.
+    # macos-15 is the current GitHub-hosted image with Xcode for iOS builds.
+    runs-on: macos-15
     timeout-minutes: 45
 
     steps:
@@ -60,6 +61,16 @@ jobs:
             /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string DylibAnalyzer" "$PLIST"
           /usr/libexec/PlistBuddy -c "Add :UIFileSharingEnabled bool true" "$PLIST" 2>/dev/null || true
           /usr/libexec/PlistBuddy -c "Add :LSSupportsOpeningDocumentsInPlace bool true" "$PLIST" 2>/dev/null || true
+
+      - name: Install app icon
+        working-directory: ${{ env.BUILD_DIR }}
+        run: |
+          set -euo pipefail
+          ICONSET="ios/Runner/Assets.xcassets/AppIcon.appiconset"
+          mkdir -p "$ICONSET"
+          cp -R "$GITHUB_WORKSPACE/assets/icon/AppIcon.appiconset/." "$ICONSET/"
+          test -f "$ICONSET/Icon-App-1024x1024@1x.png"
+          echo "Installed AppIcon.appiconset ($(ls -1 "$ICONSET"/*.png | wc -l | tr -d ' ') pngs)"
 
       - name: Resolve Dart dependencies
         working-directory: ${{ env.BUILD_DIR }}
