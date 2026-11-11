@@ -1,0 +1,25 @@
+name: danalyse
+description: "DylibAnalyzer: static iOS dylib analyzer built with Flutter."
+publish_to: "none"
+version: 0.1.0+1
+
+environment:
+  sdk: ">=3.3.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cross_file: ^0.3.4+2
+  crypto: ^3.0.3
+  file_picker: ^8.0.6
+  path: ^1.9.0
+  path_provider: ^2.1.4
+  share_plus: ^7.2.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true

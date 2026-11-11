@@ -1,0 +1,116 @@
+name: build-ios-ipa
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # macOS runner is required for Xcode / iOS toolchain.
+    runs-on: macos-14
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: "3.24.5"
+          cache: true
+
+      - name: Flutter version
+        run: flutter --version
+
+      - name: Create clean iOS build shell
+        # The repo stores only lib/ + pubspec.yaml. Build in a fresh Flutter
+        # project so the generated ios/ Runner project is always consistent.
+        run: |
+          set -euo pipefail
+          BUILD_DIR="$RUNNER_TEMP/danalyse_build"
+          rm -rf "$BUILD_DIR"
+          flutter create \
+            --platforms=ios \
+            --org com.netskao \
+            --project-name danalyse \
+            "$BUILD_DIR"
+          # Drop the generated widget_test.dart: it imports MyApp, which this
+          # app does not define, and would make `flutter analyze` fail.
+          rm -rf "$BUILD_DIR/test"
+          mkdir -p "$BUILD_DIR/lib"
+          cp -R lib/. "$BUILD_DIR/lib/"
+          cp pubspec.yaml "$BUILD_DIR/pubspec.yaml"
+          if [ -f analysis_options.yaml ]; then
+            cp analysis_options.yaml "$BUILD_DIR/analysis_options.yaml"
+          fi
+          echo "BUILD_DIR=$BUILD_DIR" >> "$GITHUB_ENV"
+
+      - name: Patch Info.plist (display name / Files sharing)
+        working-directory: ${{ env.BUILD_DIR }}
+        run: |
+          PLIST="ios/Runner/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName DylibAnalyzer" "$PLIST" 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string DylibAnalyzer" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Add :UIFileSharingEnabled bool true" "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :LSSupportsOpeningDocumentsInPlace bool true" "$PLIST" 2>/dev/null || true
+
+      - name: Resolve Dart dependencies
+        working-directory: ${{ env.BUILD_DIR }}
+        run: flutter pub get
+
+      - name: Analyze (errors fail the build; warnings/infos do not)
+        working-directory: ${{ env.BUILD_DIR }}
+        run: flutter analyze --no-fatal-warnings --no-fatal-infos
+
+      - name: Install CocoaPods
+        working-directory: ${{ env.BUILD_DIR }}/ios
+        run: |
+          # flutter build ios runs pod install itself; only do it early when a
+          # Podfile already exists (plugins added by pub get).
+          if [ -f Podfile ]; then
+            pod install --repo-update
+          else
+            echo "No Podfile yet; flutter build ios will generate and install pods."
+          fi
+
+      - name: Build iOS (unsigned)
+        working-directory: ${{ env.BUILD_DIR }}
+        run: |
+          flutter build ios \
+            --release \
+            --no-codesign
+
+      - name: Package unsigned IPA
+        working-directory: ${{ env.BUILD_DIR }}
+        run: |
+          set -euo pipefail
+          APP="build/ios/iphoneos/Runner.app"
+          test -d "$APP"
+          rm -rf Payload Danalyse-unsigned.ipa
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qry Danalyse-unsigned.ipa Payload
+          shasum -a 256 Danalyse-unsigned.ipa > Danalyse-unsigned.ipa.sha256
+          cp Danalyse-unsigned.ipa Danalyse-unsigned.ipa.sha256 "$GITHUB_WORKSPACE/"
+          ls -lh Danalyse-unsigned.ipa
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Danalyse-unsigned-ipa
+          path: |
+            Danalyse-unsigned.ipa
+            Danalyse-unsigned.ipa.sha256
+          if-no-files-found: error
+
+      # Signed IPA (optional, later):
+      # - Add signing certificate / provisioning profile secrets.
+      # - Use `flutter build ipa --export-options-plist=...` or xcodebuild
+      #   -exportArchive instead of the --no-codesign + Payload zip above.
