@@ -1,4 +1,3 @@
-import 'dart:convert';
 import 'dart:typed_data';
 
 import '../models/analysis.dart';
@@ -18,10 +17,19 @@ class ObjCParser {
     final out = <ObjCClassInfo>[];
     final seen = <int>{};
     for (final section in macho.sectionsNamed('__objc_classlist')) {
-      final raw = macho.sectionBytes(section);
-      for (var i = 0; i + 8 <= raw.length; i += 8) {
-        final ptr = ByteData.view(raw.buffer, raw.offsetInBytes + i, 8)
-            .getUint64(0, Endian.little);
+      for (var i = 0; i + 8 <= section.size; i += 8) {
+        final ptr = macho.readU64Vm(section.addr + i) ?? 0;
+        if (ptr == 0 || seen.contains(ptr)) continue;
+        seen.add(ptr);
+        final c = _parseClass(ptr);
+        if (c != null && c.name.isNotEmpty) out.add(c);
+      }
+    }
+    for (final section in [
+      ...macho.sectionsNamed('__objc_nlclslist'),
+    ]) {
+      for (var i = 0; i + 8 <= section.size; i += 8) {
+        final ptr = macho.readU64Vm(section.addr + i) ?? 0;
         if (ptr == 0 || seen.contains(ptr)) continue;
         seen.add(ptr);
         final c = _parseClass(ptr);
@@ -31,11 +39,10 @@ class ObjCParser {
     for (final section in [
       ...macho.sectionsNamed('__objc_catlist'),
       ...macho.sectionsNamed('__objc_catlist2'),
+      ...macho.sectionsNamed('__objc_nlcatlist'),
     ]) {
-      final raw = macho.sectionBytes(section);
-      for (var i = 0; i + 8 <= raw.length; i += 8) {
-        final ptr = ByteData.view(raw.buffer, raw.offsetInBytes + i, 8)
-            .getUint64(0, Endian.little);
+      for (var i = 0; i + 8 <= section.size; i += 8) {
+        final ptr = macho.readU64Vm(section.addr + i) ?? 0;
         if (ptr == 0) continue;
         final c = _parseCategory(ptr);
         if (c != null && c.name.isNotEmpty) out.add(c);
@@ -45,58 +52,78 @@ class ObjCParser {
     return out;
   }
 
+  static int _classData(int bits) => bits & 0x00007FFFFFFFFFF8;
+
   ObjCClassInfo? _parseClass(int addr) {
-    final raw = _readVm(addr, 40);
-    if (raw == null) return null;
-    final bd = ByteData.view(raw.buffer, raw.offsetInBytes, raw.lengthInBytes);
-    final superclass = bd.getUint64(8, Endian.little);
-    final data = bd.getUint64(32, Endian.little);
+    if (macho.readVm(addr, 40) == null) return null;
+    final data = _roOfClass(addr);
     final name = _className(addr);
     if (name.isEmpty) return null;
-    final methods = _parseMethods(_roField(data, 32));
+    final isa = macho.readU64Vm(addr) ?? 0;
+    final methods = [
+      ..._parseMethods(_roField(data, 32)),
+      ..._parseMethods(_roField(_roOfClass(isa), 32)),
+    ];
     return ObjCClassInfo(
       name: name,
-      superclass: _className(superclass),
+      superclass: _superclassName(addr + 8),
       address: addr,
       methods: methods,
     );
   }
 
   ObjCClassInfo? _parseCategory(int addr) {
-    final raw = _readVm(addr, 7 * 8);
-    if (raw == null) return null;
-    final bd = ByteData.view(raw.buffer, raw.offsetInBytes, raw.lengthInBytes);
-    final catName = _stringAt(bd.getUint64(0, Endian.little));
-    final cls = bd.getUint64(8, Endian.little);
-    final instanceMethods = bd.getUint64(16, Endian.little);
-    final classMethods = bd.getUint64(24, Endian.little);
+    if (macho.readVm(addr, 7 * 8) == null) return null;
+    final catName = _stringAt(macho.readU64Vm(addr) ?? 0);
+    final cls = macho.readU64Vm(addr + 8) ?? 0;
+    final instanceMethods = macho.readU64Vm(addr + 16) ?? 0;
+    final classMethods = macho.readU64Vm(addr + 24) ?? 0;
     final methods = <ObjCMethodInfo>[
       ..._parseMethods(instanceMethods),
       ..._parseMethods(classMethods),
     ];
-    final name = _className(cls);
-    if (name.isEmpty) return null;
+    var name = _className(cls);
+    if (name.isEmpty) name = _stringAt(cls);
+    if (name.isEmpty && catName.isEmpty) return null;
+    final label = name.isEmpty ? catName : (catName.isEmpty ? name : '$name($catName)');
     return ObjCClassInfo(
-      name: '$name($catName)',
+      name: label,
       superclass: '',
       address: addr,
       methods: methods,
     );
   }
 
+  int _roOfClass(int classAddr) {
+    if (classAddr == 0) return 0;
+    final data = _classData(macho.readU64Vm(classAddr + 32) ?? 0);
+    if (data == 0) return 0;
+    if (_stringAt(_roField(data, 24)).isNotEmpty) return data;
+    for (final off in [8, 16, 32]) {
+      final ro = _classData(_roField(data, off));
+      if (ro != 0 && _stringAt(_roField(ro, 24)).isNotEmpty) return ro;
+    }
+    return data;
+  }
+
   String _className(int classAddr) {
     if (classAddr == 0) return '';
-    final data = macho.readU64Vm(classAddr + 32);
-    if (data == null || data == 0) return '';
-    final namePtr = _roField(data, 24);
-    return _stringAt(namePtr);
+    return _stringAt(_roField(_roOfClass(classAddr), 24));
+  }
+
+  String _superclassName(int slotAddr) {
+    final ptr = macho.readU64Vm(slotAddr) ?? 0;
+    final name = _className(ptr);
+    if (name.isNotEmpty) return name;
+    final bind = macho.bindNameAtVm(slotAddr) ?? '';
+    const prefix = '_OBJC_CLASS_\$_';
+    if (bind.startsWith(prefix)) return bind.substring(prefix.length);
+    return '';
   }
 
   int _roField(int ro, int offset) {
-    final raw = _readVm(ro + offset, 8);
-    if (raw == null) return 0;
-    return ByteData.view(raw.buffer, raw.offsetInBytes, 8)
-        .getUint64(0, Endian.little);
+    if (ro == 0) return 0;
+    return macho.readU64Vm(ro + offset) ?? 0;
   }
 
   List<ObjCMethodInfo> _parseMethods(int listAddr) {
@@ -109,7 +136,8 @@ class ObjCParser {
     if (count == 0 || count > 10000) return const [];
 
     final isRelative = (rawEntsize & 0x80000000) != 0;
-    final entsize = rawEntsize & 0x7FFFFFFF;
+    final directSels = (rawEntsize & 0x40000000) != 0;
+    final entsize = rawEntsize & 0x0000FFFC;
     final out = <ObjCMethodInfo>[];
     for (var i = 0; i < count; i++) {
       if (isRelative) {
@@ -122,19 +150,18 @@ class ObjCParser {
         final typesOff = eb.getInt32(4, Endian.little);
         final impOff = eb.getInt32(8, Endian.little);
         out.add(ObjCMethodInfo(
-          selector: _stringAt(entryAddr + nameOff),
-          types: _stringAt(entryAddr + 4 + typesOff),
+          selector: _stringAtRel(entryAddr, nameOff, direct: directSels),
+          types: _stringAtRel(entryAddr + 4, typesOff, direct: true),
           imp: entryAddr + 8 + impOff,
         ));
       } else {
         final entrySize = entsize < 24 ? 24 : entsize;
-        final entry = _readVm(listAddr + 8 + i * entrySize, 24);
-        if (entry == null) break;
-        final eb = ByteData.view(entry.buffer, entry.offsetInBytes, 24);
+        final entryAddr = listAddr + 8 + i * entrySize;
+        if (_readVm(entryAddr, 24) == null) break;
         out.add(ObjCMethodInfo(
-          selector: _stringAt(eb.getUint64(0, Endian.little)),
-          types: _stringAt(eb.getUint64(8, Endian.little)),
-          imp: eb.getUint64(16, Endian.little),
+          selector: _stringAt(macho.readU64Vm(entryAddr) ?? 0),
+          types: _stringAt(macho.readU64Vm(entryAddr + 8) ?? 0),
+          imp: macho.readU64Vm(entryAddr + 16) ?? 0,
         ));
       }
     }
@@ -148,5 +175,16 @@ class ObjCParser {
     final s = macho.cStringVm(addr, max: 512);
     if (s == null) return '';
     return s.replaceAll(RegExp(r'[\u0000-\u001f]'), '');
+  }
+
+  String _stringAtRel(int fieldAddr, int rel, {required bool direct}) {
+    final target = fieldAddr + rel;
+    if (direct) return _stringAt(target);
+    final ptr = macho.readU64Vm(target);
+    if (ptr != null && ptr != 0) {
+      final s = _stringAt(ptr);
+      if (s.isNotEmpty) return s;
+    }
+    return _stringAt(target);
   }
 }

@@ -20,13 +20,22 @@ class HookScanner {
 
   final MachOFile macho;
 
-  static const Set<String> _hookSymbols = {
+    static const Set<String> _hookSymbols = {
     '_class_copyMethodList',
     '_method_setImplementation',
+    '_method_getImplementation',
     '_method_getName',
     '_class_addMethod',
+    '_class_replaceMethod',
     '_class_getMethodImplementation',
+    '_class_getInstanceMethod',
+    '_class_getClassMethod',
     '_objc_getClass',
+    '_NSClassFromString',
+    '_MSHookMessageEx',
+    '_MSHookFunction',
+    '_fishhook_rebind_symbols',
+    '_rebind_symbols',
   };
 
   List<HookInfo> scan() {
@@ -87,6 +96,9 @@ class HookScanner {
     macho.stubs.forEach((addr, name) {
       if (_hookSymbols.contains(name)) interesting[addr] = name;
     });
+    macho.gotImports.forEach((addr, name) {
+      if (_hookSymbols.contains(name)) interesting[addr] = name;
+    });
     final helpers = <int>{};
     for (var i = 0; i < starts.length; i++) {
       final start = starts[i];
@@ -94,14 +106,20 @@ class HookScanner {
       final calls = <String>{};
       for (var pc = start; pc + 4 <= end; pc += 4) {
         final insn = macho.readU32Vm(pc);
-        if (insn == null || !Arm64Decoder.isBl(insn)) continue;
-        final target = Arm64Decoder.branchTarget(pc, insn);
-        final name = interesting[target];
-        if (name != null) calls.add(name);
+        if (insn == null) continue;
+        for (final name in _callNames(pc, insn, interesting)) {
+          calls.add(name);
+        }
       }
       if (calls.contains('_method_setImplementation') ||
           calls.contains('_class_addMethod') ||
-          (calls.contains('_class_copyMethodList') && calls.length >= 2)) {
+          calls.contains('_class_replaceMethod') ||
+          calls.contains('_MSHookMessageEx') ||
+          calls.contains('_MSHookFunction') ||
+          (calls.contains('_class_copyMethodList') && calls.length >= 2) ||
+          (calls.contains('_method_getImplementation') &&
+              (calls.contains('_class_getInstanceMethod') ||
+                  calls.contains('_class_getClassMethod')))) {
         helpers.add(start);
       }
     }
@@ -113,42 +131,42 @@ class HookScanner {
     final sites = <int>[];
     final siteSet = <int>{};
 
-    // Fallback: if no helper was recognized, treat direct calls to the
-    // method-replacement stub as hook sites. Confidence will be lower.
-    if (helpers.isEmpty) {
-      final directTargets = <int>{};
-      macho.stubs.forEach((addr, name) {
-        if (name == '_method_setImplementation' ||
-            name == '_class_addMethod') {
-          directTargets.add(addr);
-        }
-      });
-      if (directTargets.isEmpty) return sites;
-      for (var i = 0; i < starts.length; i++) {
-        final start = starts[i];
-        final end = _functionEnd(start, starts);
-        for (var pc = start; pc + 4 <= end; pc += 4) {
-          final insn = macho.readU32Vm(pc);
-          if (insn == null || !Arm64Decoder.isBl(insn)) continue;
-          if (directTargets.contains(Arm64Decoder.branchTarget(pc, insn))) {
-            if (siteSet.add(pc)) sites.add(pc);
-          }
-        }
+    final directTargets = <int>{};
+    void consider(int addr, String name) {
+      if (_isHookName(name) &&
+          (name.contains('setImplementation') ||
+              name.contains('addMethod') ||
+              name.contains('replaceMethod') ||
+              name.contains('MSHook'))) {
+        directTargets.add(addr);
       }
-      return sites;
     }
+
+    macho.stubs.forEach(consider);
+    macho.gotImports.forEach(consider);
+
     for (var i = 0; i < starts.length; i++) {
       final start = starts[i];
       final end = _functionEnd(start, starts);
       for (var pc = start; pc + 4 <= end; pc += 4) {
         final insn = macho.readU32Vm(pc);
-        if (insn == null || !Arm64Decoder.isBl(insn)) continue;
-        if (helpers.contains(Arm64Decoder.branchTarget(pc, insn))) {
+        if (insn == null) continue;
+        if ((Arm64Decoder.isBl(insn) || Arm64Decoder.isB(insn)) &&
+            helpers.contains(Arm64Decoder.branchTarget(pc, insn))) {
+          if (siteSet.add(pc)) sites.add(pc);
+        }
+        if (directTargets.isNotEmpty && _hitsTargets(pc, insn, directTargets)) {
           if (siteSet.add(pc)) sites.add(pc);
         }
       }
     }
     return sites;
+  }
+
+  bool _isHookName(String name) {
+    if (_hookSymbols.contains(name)) return true;
+    if (!name.startsWith('_') && _hookSymbols.contains('_$name')) return true;
+    return false;
   }
 
   List<_StringCandidate> _collectCandidates(int start, int end) {
@@ -198,17 +216,26 @@ class HookScanner {
     if (direct != null && _plausible(direct)) return direct;
 
     final ptr = macho.readU64Vm(address);
-    if (ptr == null || ptr == 0) return null;
-    final pointed = _clean(macho.cStringVm(ptr));
-    if (pointed != null && _plausible(pointed)) return pointed;
+    if (ptr != null && ptr != 0) {
+      final pointed = _clean(macho.cStringVm(ptr));
+      if (pointed != null && _plausible(pointed)) return pointed;
+    }
 
-    // Class reference -> class_t -> class_ro_t.name
-    final data = macho.readU64Vm(ptr + 32);
-    if (data != null && data != 0) {
-      final namePtr = macho.readU64Vm(data + 24);
-      if (namePtr != null && namePtr != 0) {
-        final name = _clean(macho.cStringVm(namePtr));
-        if (name != null && _plausible(name)) return name;
+    final cfPtr = macho.readU64Vm(address + 16) ?? 0;
+    final cfLen = macho.readU64Vm(address + 24) ?? 0;
+    if (cfPtr != 0 && cfLen > 0 && cfLen < 256) {
+      final cf = _clean(macho.cStringVm(cfPtr));
+      if (cf != null && cf.length == cfLen && _plausible(cf)) return cf;
+    }
+
+    if (ptr != null && ptr != 0) {
+      final data = (macho.readU64Vm(ptr + 32) ?? 0) & 0x00007FFFFFFFFFF8;
+      if (data != 0) {
+        final namePtr = macho.readU64Vm(data + 24);
+        if (namePtr != null && namePtr != 0) {
+          final name = _clean(macho.cStringVm(namePtr));
+          if (name != null && _plausible(name)) return name;
+        }
       }
     }
     return null;
@@ -305,5 +332,45 @@ class HookScanner {
     if (op == 0xB9400000 || op == 0xB9000000) return 4;
     if (op == 0x79400000 || op == 0x79000000) return 2;
     return 1;
+  }
+
+  Iterable<String> _callNames(int pc, int insn, Map<int, String> interesting) sync* {
+    if (Arm64Decoder.isBl(insn) || Arm64Decoder.isB(insn)) {
+      final name = interesting[Arm64Decoder.branchTarget(pc, insn)];
+      if (name != null) yield name;
+      return;
+    }
+    if (Arm64Decoder.isAdrp(insn)) {
+      final page = Arm64Decoder.adrpTarget(pc, insn);
+      final next = macho.readU32Vm(pc + 4);
+      if (next == null) return;
+      if (Arm64Decoder.isAdd(next) && (next & 0x80000000) != 0) {
+        final addr = page + Arm64Decoder.addImmValue(next);
+        final name = interesting[addr] ?? macho.gotImports[addr];
+        if (name != null && _hookSymbols.contains(name)) yield name;
+      } else if (Arm64Decoder.isLoadStoreUnsigned(next)) {
+        final size = _loadSize(next);
+        final addr = page + Arm64Decoder.imm12(next) * size;
+        final name = interesting[addr] ?? macho.gotImports[addr];
+        if (name != null && _hookSymbols.contains(name)) yield name;
+      }
+    }
+  }
+
+  bool _hitsTargets(int pc, int insn, Set<int> targets) {
+    if (Arm64Decoder.isBl(insn) || Arm64Decoder.isB(insn)) {
+      return targets.contains(Arm64Decoder.branchTarget(pc, insn));
+    }
+    if (!Arm64Decoder.isAdrp(insn)) return false;
+    final page = Arm64Decoder.adrpTarget(pc, insn);
+    final next = macho.readU32Vm(pc + 4);
+    if (next == null) return false;
+    int? addr;
+    if (Arm64Decoder.isAdd(next) && (next & 0x80000000) != 0) {
+      addr = page + Arm64Decoder.addImmValue(next);
+    } else if (Arm64Decoder.isLoadStoreUnsigned(next)) {
+      addr = page + Arm64Decoder.imm12(next) * _loadSize(next);
+    }
+    return addr != null && targets.contains(addr);
   }
 }

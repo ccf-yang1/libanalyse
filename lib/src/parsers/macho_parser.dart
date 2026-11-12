@@ -18,6 +18,9 @@ const int lcLazyLoadDylib = 0x20;
 const int lcUuid = 0x1B;
 const int lcEncryptionInfo64 = 0x2C;
 const int lcFunctionStarts = 0x26;
+const int lcDyldInfo = 0x22;
+const int lcDyldInfoOnly = 0x80000022;
+const int lcDyldChainedFixups = 0x80000034;
 
 class SymbolEntry {
   const SymbolEntry(this.name, this.type, this.value);
@@ -86,6 +89,7 @@ class MachOFile {
   final List<int> functionStarts = [];
   final List<int> initFunctions = [];
   final Map<int, String> stubs = {};
+  final Map<int, String> gotImports = {};
 
   int cpuType = 0;
   int cpuSubType = 0;
@@ -106,8 +110,22 @@ class MachOFile {
   int _nindirect = 0;
   int _fsDataOff = 0;
   int _fsDataSize = 0;
+  int _chainedOff = 0;
+  int _chainedSize = 0;
+  int _bindOff = 0;
+  int _bindSize = 0;
+  int _lazyBindOff = 0;
+  int _lazyBindSize = 0;
+  int _textBase = 0;
+  final Map<int, int> _fixups = {};
+  final Map<int, String> _bindNames = {};
 
   ByteData get _bd => ByteData.view(data.buffer, data.offsetInBytes, data.lengthInBytes);
+
+  int u16(int off) {
+    if (off < 0 || off + 2 > data.length) return 0;
+    return _bd.getUint16(off, Endian.little);
+  }
 
   int u32(int off) {
     if (off < 0 || off + 4 > data.length) return 0;
@@ -174,7 +192,16 @@ class MachOFile {
   int? readU64Vm(int addr) {
     final off = vmToFileOffset(addr);
     if (off == null) return null;
+    final fixed = _fixups[off];
+    if (fixed != null) return fixed;
+    if (_bindNames.containsKey(off)) return 0;
     return u64(off);
+  }
+
+  String? bindNameAtVm(int addr) {
+    final off = vmToFileOffset(addr);
+    if (off == null) return null;
+    return _bindNames[off];
   }
 
   String? cStringVm(int addr, {int max = 256}) {
@@ -208,8 +235,12 @@ class MachOFile {
 
     _parseSymbols();
     _parseFunctionStarts();
+    _applyChainedFixups();
+    _applyClassicBind(_bindOff, _bindSize);
+    _applyClassicBind(_lazyBindOff, _lazyBindSize);
     _parseInitFunctions();
     _parseStubs();
+    _parseGotImports();
 
     final text = section('__TEXT', '__text');
     if (text != null) {
@@ -225,6 +256,7 @@ class MachOFile {
       final vmsize = u64(off + 32);
       final fileoff = u64(off + 40);
       final filesize = u64(off + 48);
+      if (name == '__TEXT') _textBase = vmaddr;
       segments.add(SegmentInfo(
         name: name,
         vmAddr: vmaddr,
@@ -273,6 +305,14 @@ class MachOFile {
     } else if (cmd == lcFunctionStarts) {
       _fsDataOff = u32(off + 8);
       _fsDataSize = u32(off + 12);
+    } else if (cmd == lcDyldChainedFixups) {
+      _chainedOff = u32(off + 8);
+      _chainedSize = u32(off + 12);
+    } else if (cmd == lcDyldInfo || cmd == lcDyldInfoOnly) {
+      _bindOff = u32(off + 16);
+      _bindSize = u32(off + 20);
+      _lazyBindOff = u32(off + 32);
+      _lazyBindSize = u32(off + 36);
     }
   }
 
@@ -343,10 +383,8 @@ class MachOFile {
 
   void _parseInitFunctions() {
     for (final s in sectionsNamed('__mod_init_func')) {
-      final raw = sectionBytes(s);
-      for (var i = 0; i + 8 <= raw.length; i += 8) {
-        final ptr = ByteData.view(raw.buffer, raw.offsetInBytes + i, 8)
-            .getUint64(0, Endian.little);
+      for (var i = 0; i + 8 <= s.size; i += 8) {
+        final ptr = readU64Vm(s.addr + i) ?? 0;
         if (ptr != 0) initFunctions.add(ptr);
       }
     }
@@ -385,4 +423,316 @@ class MachOFile {
   Map<String, SectionInfo> get sectionMap => {
         for (final s in sections) '${s.segmentName},${s.name}': s,
       };
+
+  void _parseGotImports() {
+    for (final s in [
+      ...sectionsNamed('__got'),
+      ...sectionsNamed('__auth_got'),
+      ...sectionsNamed('__la_symbol_ptr'),
+      ...sectionsNamed('__nl_symbol_ptr'),
+    ]) {
+      for (var i = 0; i + 8 <= s.size; i += 8) {
+        final name = bindNameAtVm(s.addr + i);
+        if (name != null && name.isNotEmpty) {
+          gotImports[s.addr + i] = name;
+        }
+      }
+    }
+  }
+
+  int _readUleb(int start, int end, List<int> cursor) {
+    var value = 0;
+    var shift = 0;
+    var i = cursor[0];
+    while (i < end) {
+      final c = data[i++];
+      value |= (c & 0x7F) << shift;
+      shift += 7;
+      if ((c & 0x80) == 0) break;
+    }
+    cursor[0] = i;
+    return value;
+  }
+
+  int _readSleb(int start, int end, List<int> cursor) {
+    var value = 0;
+    var shift = 0;
+    var i = cursor[0];
+    var c = 0;
+    while (i < end) {
+      c = data[i++];
+      value |= (c & 0x7F) << shift;
+      shift += 7;
+      if ((c & 0x80) == 0) break;
+    }
+    cursor[0] = i;
+    if (shift < 64 && (c & 0x40) != 0) {
+      value |= (~0) << shift;
+    }
+    return value;
+  }
+
+  void _applyClassicBind(int off, int size) {
+    if (size == 0) return;
+    final start = off.clamp(0, data.length).toInt();
+    final end = (off + size).clamp(0, data.length).toInt();
+    final cursor = [start];
+    var segIndex = 0;
+    var segOff = 0;
+    var symbol = '';
+    while (cursor[0] < end) {
+      final b = data[cursor[0]++];
+      final op = b & 0xF0;
+      final imm = b & 0x0F;
+      switch (op) {
+        case 0x00:
+          return;
+        case 0x10:
+        case 0x20:
+          _readUleb(start, end, cursor);
+          break;
+        case 0x30:
+          break;
+        case 0x40:
+          symbol = cString(cursor[0], max: 1024);
+          cursor[0] += symbol.length + 1;
+          break;
+        case 0x50:
+          break;
+        case 0x60:
+          _readSleb(start, end, cursor);
+          break;
+        case 0x70:
+          segIndex = imm;
+          segOff = _readUleb(start, end, cursor);
+          break;
+        case 0x80:
+          segOff += _readUleb(start, end, cursor);
+          break;
+        case 0x90:
+          _bindAt(segIndex, segOff, symbol);
+          segOff += 8;
+          break;
+        case 0xA0:
+          _bindAt(segIndex, segOff, symbol);
+          segOff += _readUleb(start, end, cursor) + 8;
+          break;
+        case 0xB0:
+          _bindAt(segIndex, segOff, symbol);
+          segOff += imm * 8 + 8;
+          break;
+        case 0xC0:
+          final times = _readUleb(start, end, cursor);
+          final skip = _readUleb(start, end, cursor);
+          for (var i = 0; i < times; i++) {
+            _bindAt(segIndex, segOff, symbol);
+            segOff += skip + 8;
+          }
+          break;
+      }
+    }
+  }
+
+  void _bindAt(int segIndex, int segOff, String symbol) {
+    if (segIndex < 0 || segIndex >= segments.length) return;
+    final seg = segments[segIndex];
+    if (segOff < 0 || segOff + 8 > seg.fileSize) return;
+    final fileOff = seg.fileOffset + segOff;
+    if (symbol.isNotEmpty) _bindNames[fileOff] = symbol;
+  }
+
+  void _applyChainedFixups() {
+    if (_chainedSize < 28) return;
+    final base = _chainedOff;
+    if (base < 0 || base + 28 > data.length) return;
+    final startsOffset = u32(base + 4);
+    final importsOffset = u32(base + 8);
+    final symbolsOffset = u32(base + 12);
+    final importsCount = u32(base + 16);
+    final importsFormat = u32(base + 20);
+    final importNames = _chainedImportNames(
+      base,
+      importsOffset,
+      symbolsOffset,
+      importsCount,
+      importsFormat,
+    );
+
+    final startsAt = base + startsOffset;
+    if (startsAt + 4 > data.length) return;
+    final segCount = u32(startsAt);
+    for (var segIndex = 0; segIndex < segCount; segIndex++) {
+      final infoRel = u32(startsAt + 4 + segIndex * 4);
+      if (infoRel == 0) continue;
+      _walkChainedSegment(startsAt + infoRel, importNames);
+    }
+  }
+
+  List<String> _chainedImportNames(
+    int base,
+    int importsOffset,
+    int symbolsOffset,
+    int importsCount,
+    int importsFormat,
+  ) {
+    final names = List<String>.filled(importsCount, '');
+    var entrySize = 4;
+    if (importsFormat == 2) entrySize = 8;
+    if (importsFormat == 3) entrySize = 16;
+    for (var i = 0; i < importsCount; i++) {
+      final entryOff = base + importsOffset + i * entrySize;
+      if (entryOff + entrySize > data.length) break;
+      int nameOff;
+      if (importsFormat == 3) {
+        final raw = u64(entryOff);
+        nameOff = ((raw >> 32) & 0xFFFFFFFF).toInt();
+      } else {
+        final raw = u32(entryOff);
+        nameOff = (raw >> 9) & 0x7FFFFF;
+      }
+      names[i] = cString(base + symbolsOffset + nameOff, max: 1024);
+    }
+    return names;
+  }
+
+  void _walkChainedSegment(int infoOff, List<String> importNames) {
+    if (infoOff + 22 > data.length) return;
+    final pageSize = u16(infoOff + 4);
+    final pointerFormat = u16(infoOff + 6);
+    final segmentOffset = u64(infoOff + 8);
+    final pageCount = u16(infoOff + 20);
+    if (pageSize == 0 || pageCount == 0) return;
+    final stride = _chainedStride(pointerFormat);
+    final starts = infoOff + 22;
+    for (var page = 0; page < pageCount; page++) {
+      final startOff = starts + page * 2;
+      if (startOff + 2 > data.length) break;
+      var pageStart = u16(startOff);
+      if (pageStart == 0xFFFF) continue;
+      if ((pageStart & 0x8000) != 0) {
+        var idx = pageStart & 0x7FFF;
+        while (true) {
+          final overflowOff = starts + pageCount * 2 + idx * 2;
+          if (overflowOff + 2 > data.length) break;
+          final ov = u16(overflowOff);
+          if ((ov & 0x8000) == 0) {
+            _walkChainVm(
+              _textBase + segmentOffset + page * pageSize + ov,
+              pointerFormat,
+              stride,
+              importNames,
+            );
+            break;
+          }
+          _walkChainVm(
+            _textBase + segmentOffset + page * pageSize + (ov & 0x7FFF),
+            pointerFormat,
+            stride,
+            importNames,
+          );
+          idx++;
+        }
+      } else {
+        _walkChainVm(
+          _textBase + segmentOffset + page * pageSize + pageStart,
+          pointerFormat,
+          stride,
+          importNames,
+        );
+      }
+    }
+  }
+
+  int _chainedStride(int format) {
+    switch (format) {
+      case 1:
+      case 9:
+      case 12:
+        return 8;
+      default:
+        return 4;
+    }
+  }
+
+  void _walkChainVm(
+    int vmAddr,
+    int format,
+    int stride,
+    List<String> importNames,
+  ) {
+    var addr = vmAddr;
+    final seen = <int>{};
+    while (addr > 0 && seen.add(addr)) {
+      final fileOff = vmToFileOffset(addr);
+      if (fileOff == null || fileOff + 8 > data.length) break;
+      final raw = u64(fileOff);
+      final next = _chainedNext(raw, format);
+      final decoded = _decodeChained(raw, format, importNames);
+      if (decoded.$1 != null) _fixups[fileOff] = decoded.$1!;
+      if (decoded.$2 != null && decoded.$2!.isNotEmpty) {
+        _bindNames[fileOff] = decoded.$2!;
+      }
+      if (next == 0) break;
+      addr += next * stride;
+    }
+  }
+
+  int _chainedNext(int raw, int format) {
+    switch (format) {
+      case 1:
+      case 7:
+      case 9:
+      case 10:
+      case 12:
+        return (raw >> 51) & 0x7FF;
+      case 2:
+      case 6:
+        return (raw >> 51) & 0xFFF;
+      default:
+        return 0;
+    }
+  }
+
+  (int?, String?) _decodeChained(int raw, int format, List<String> importNames) {
+    switch (format) {
+      case 2:
+      case 6:
+        final bind = (raw >> 63) & 1;
+        if (bind != 0) {
+          final ordinal = raw & 0xFFFFFF;
+          final name = ordinal < importNames.length ? importNames[ordinal] : '';
+          return (null, name);
+        }
+        final target = raw & 0xFFFFFFFFF;
+        final high8 = (raw >> 36) & 0xFF;
+        var vm = (high8 << 56) | target;
+        if (format == 6) vm += _textBase;
+        return (vm, null);
+      case 1:
+      case 7:
+      case 9:
+      case 10:
+      case 12:
+        final bind = (raw >> 62) & 1;
+        final auth = (raw >> 63) & 1;
+        if (bind != 0) {
+          final ordinal = format == 12 ? (raw & 0xFFFFFF) : (raw & 0xFFFF);
+          final name = ordinal < importNames.length ? importNames[ordinal] : '';
+          return (null, name);
+        }
+        if (auth != 0) {
+          final target = raw & 0xFFFFFFFF;
+          return (target + _textBase, null);
+        }
+        if (format == 9 || format == 12) {
+          final target = raw & 0x7FFFFFFFFFF;
+          return (target + _textBase, null);
+        }
+        final target = raw & 0x7FFFFFFFFFF;
+        final high8 = (raw >> 43) & 0xFF;
+        return ((high8 << 56) | target, null);
+      default:
+        return (null, null);
+    }
+  }
 }
